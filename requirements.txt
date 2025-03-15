@@ -1,0 +1,7 @@
+streamlit
+numpy
+faiss-cpu
+requests
+sentence-transformers
+rank_bm25
+watchdog
