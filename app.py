@@ -86,6 +86,38 @@ def rerank_chunks(query, retrieved_chunks, top_k=3):
     ranked_indices = np.argsort(similarities)[::-1][:top_k]
     return [retrieved_chunks[i] for i in ranked_indices]
 
+def compute_bm25_confidence(bm25_scores):
+    """Normalize BM25 scores to a confidence range of [0,1]"""
+    if len(bm25_scores) == 0:
+        return []
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    normalized_scores = scaler.fit_transform(np.array(bm25_scores).reshape(-1, 1)).flatten()
+    return normalized_scores
+
+def compute_embedding_confidence(query, retrieved_chunks, embed_model):
+    """Compute cosine similarity between query embedding and retrieved chunks"""
+    query_embedding = embed_model.encode([query])
+    chunk_embeddings = embed_model.encode(retrieved_chunks)
+
+    # Compute cosine similarities
+    similarities = np.dot(chunk_embeddings, query_embedding.T) / (
+        np.linalg.norm(chunk_embeddings, axis=1) * np.linalg.norm(query_embedding)
+    )
+    
+    # Normalize to [0,1]
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    normalized_scores = scaler.fit_transform(similarities.reshape(-1, 1)).flatten()
+    
+    return normalized_scores
+
+def compute_final_confidence(bm25_confidences, embedding_confidences, weight_bm25=0.5, weight_embed=0.5):
+    """Compute final confidence score by weighted fusion of BM25 and embedding confidences"""
+    if len(bm25_confidences) == 0 or len(embedding_confidences) == 0:
+        return []
+    
+    final_confidences = (weight_bm25 * np.array(bm25_confidences)) + (weight_embed * np.array(embedding_confidences))
+    return final_confidences
+
 # Adaptive retrieval with BM25, Chunk Merging, and Re-ranking
 def adaptive_retrieval(query, top_k=3, advanced=False):
     query_year = get_year_from_query(query)
@@ -108,6 +140,10 @@ def adaptive_retrieval(query, top_k=3, advanced=False):
         # Step 2: Merge chunks for better context (year-aware merging)
         merged_chunks = merge_chunks(retrieved_chunks, query_year, window_size=2)
 
+        bm25_confidences = compute_bm25_confidence([bm25_scores[i] for i in top_bm25_indices])
+        embedding_confidences = compute_embedding_confidence(query, merged_chunks, embed_model)
+        final_confidences = compute_final_confidence(bm25_confidences, embedding_confidences)
+
         # Step 3: Re-rank using embeddings
         reranked_chunks = rerank_chunks(query, merged_chunks, top_k)
     else:
@@ -116,6 +152,7 @@ def adaptive_retrieval(query, top_k=3, advanced=False):
         _, faiss_results = index.search(query_embedding, top_k)
         valid_indices = [idx for idx in faiss_results[0] if idx != -1 and idx in chunk_map]
         reranked_chunks = [chunk_map[idx] for idx in valid_indices]
+        final_confidences = compute_embedding_confidence(query, reranked_chunks, embed_model)
 
     # Filter by year
     filtered_chunks = [
@@ -131,7 +168,8 @@ def adaptive_retrieval(query, top_k=3, advanced=False):
 
     response = f"Here is the information I found for the year {query_year}:\n"
     for chunk in cleaned_chunks:
-        response += f"- {chunk}\n"
+        confidence = final_confidences[i] if i < len(final_confidences) else 0.5  # Default 0.5 if missing
+        response += f"- **{chunk}**\n  (Confidence: {confidence:.2f})\n"
 
     return response
 
