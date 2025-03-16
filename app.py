@@ -8,25 +8,31 @@ from rank_bm25 import BM25Okapi
 from datetime import datetime
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import PorterStemmer
+import nltk
 
-# 1. Data Collection & Preprocessing
-def read_reports(directory="financial_reports/"):
-    all_text = []
-    for filename in os.listdir(directory):
-        if filename.endswith(".txt"):
-            with open(os.path.join(directory, filename), "r") as file:
-                all_text.append(file.read())
-    return all_text
+# Download NLTK resources (run once)
+nltk.download("punkt")
+nltk.download("stopwords")
 
-documents = read_reports()
+# Constants
+CHUNK_SIZES = {"small": 50, "medium": 100, "large": 200}
+FINANCE_KEYWORDS = ["revenue", "profit", "earnings", "financial"]
 
-# 2. Basic RAG Implementation
+# Initialize SentenceTransformer model
 embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
+def read_reports(directory="financial_reports/"):
+    """Read all financial reports from the specified directory."""
+    return [open(os.path.join(directory, filename), "r").read() 
+            for filename in os.listdir(directory) if filename.endswith(".txt")]
+
 def chunk_text(text, chunk_size=100):
-    sentences = text.split('. ')
-    chunks = []
-    current_chunk = ""
+    """Split text into chunks of a specified size."""
+    sentences = text.split(". ")
+    chunks, current_chunk = [], ""
     for sentence in sentences:
         if len(current_chunk.split()) + len(sentence.split()) <= chunk_size:
             current_chunk += sentence + ". "
@@ -37,50 +43,35 @@ def chunk_text(text, chunk_size=100):
         chunks.append(current_chunk.strip())
     return chunks
 
-# Generate chunks of different sizes for testing
-chunks_small = []
-chunks_medium = []
-chunks_large = []
-for doc in documents:
-    chunks_small.extend(chunk_text(doc, chunk_size=50))  # Small chunks
-    chunks_medium.extend(chunk_text(doc, chunk_size=100))  # Medium chunks
-    chunks_large.extend(chunk_text(doc, chunk_size=200))  # Large chunks
+def preprocess_text(text):
+    """Preprocess text for BM25: lowercase, remove stopwords, and stem (except numbers)."""
+    stop_words = set(stopwords.words("english"))
+    stemmer = PorterStemmer()
+    tokens = word_tokenize(text.lower())
+    tokens = [stemmer.stem(token) if not token.isdigit() else token
+              for token in tokens if token.isalnum() and token not in stop_words]
+    return tokens
 
-# Use medium chunks for Basic RAG
-chunks = chunks_medium
-embeddings = embed_model.encode(chunks, convert_to_numpy=True)
-index = faiss.IndexFlatL2(embeddings.shape[1])
-index.add(embeddings)
-chunk_map = {i: chunk for i, chunk in enumerate(chunks)}
-
-# 3. Advanced RAG Implementation
-# BM25 for keyword-based search
-tokenized_chunks = [chunk.split() for chunk in chunks]
-bm25 = BM25Okapi(tokenized_chunks)
-
-# Chunk Merging Function
-# Chunk Merging Function (Year-Aware)
 def merge_chunks(chunks, query_year, window_size=2):
+    """Merge chunks that belong to the same year."""
     merged_chunks = []
     i = 0
     while i < len(chunks):
-        # Check if the current chunk belongs to the query year
-        if re.search(rf'\b{query_year}\b', chunks[i]):
+        if re.search(rf"\b{query_year}\b", chunks[i]):
             merged_chunk = chunks[i]
-            # Merge subsequent chunks if they belong to the same year
             for j in range(1, window_size):
-                if i + j < len(chunks) and re.search(rf'\b{query_year}\b', chunks[i + j]):
+                if i + j < len(chunks) and re.search(rf"\b{query_year}\b", chunks[i + j]):
                     merged_chunk += " " + chunks[i + j]
                 else:
                     break
             merged_chunks.append(merged_chunk)
-            i += window_size  # Skip the merged chunks
+            i += window_size
         else:
-            i += 1  # Move to the next chunk
+            i += 1
     return merged_chunks
 
-# Re-ranking function
 def rerank_chunks(query, retrieved_chunks, top_k=3):
+    """Re-rank retrieved chunks based on cosine similarity."""
     query_embedding = embed_model.encode([query])
     chunk_embeddings = embed_model.encode(retrieved_chunks)
     similarities = cosine_similarity(query_embedding, chunk_embeddings).flatten()
@@ -88,103 +79,39 @@ def rerank_chunks(query, retrieved_chunks, top_k=3):
     return [retrieved_chunks[i] for i in ranked_indices]
 
 def compute_bm25_confidence(bm25_scores):
-    """Normalize BM25 scores to a confidence range of [0,1]"""
-    if len(bm25_scores) == 0:
-        return []
+    """Normalize BM25 scores to a confidence range of [0,1]."""
+    if bm25_scores.size == 0:
+        return np.array([])
     scaler = MinMaxScaler(feature_range=(0, 1))
-    normalized_scores = scaler.fit_transform(np.array(bm25_scores).reshape(-1, 1)).flatten()
-    return normalized_scores
+    return scaler.fit_transform(bm25_scores.reshape(-1, 1)).flatten()
 
-def compute_embedding_confidence(query, retrieved_chunks, embed_model):
-    """Compute cosine similarity between query embedding and retrieved chunks"""
+def compute_embedding_confidence(query, retrieved_chunks):
+    """Compute cosine similarity between query embedding and retrieved chunks."""
     query_embedding = embed_model.encode([query])
     chunk_embeddings = embed_model.encode(retrieved_chunks)
-
-    # Compute cosine similarities
-    similarities = np.dot(chunk_embeddings, query_embedding.T) / (
-        np.linalg.norm(chunk_embeddings, axis=1) * np.linalg.norm(query_embedding)
-    )
-    
-    # Normalize to [0,1]
+    similarities = cosine_similarity(query_embedding, chunk_embeddings).flatten()
+    if len(similarities) == 1:
+        return np.array([1.0])
     scaler = MinMaxScaler(feature_range=(0, 1))
-    normalized_scores = scaler.fit_transform(similarities.reshape(-1, 1)).flatten()
-    
-    return normalized_scores
+    return scaler.fit_transform(similarities.reshape(-1, 1)).flatten()
 
 def compute_final_confidence(bm25_confidences, embedding_confidences, weight_bm25=0.5, weight_embed=0.5):
-    """Compute final confidence score by weighted fusion of BM25 and embedding confidences"""
-    if len(bm25_confidences) == 0 or len(embedding_confidences) == 0:
-        return []
-    
-    final_confidences = (weight_bm25 * np.array(bm25_confidences)) + (weight_embed * np.array(embedding_confidences))
-    return final_confidences
+    """Compute final confidence score by weighted fusion of BM25 and embedding confidences."""
+    if bm25_confidences.size == 0 and embedding_confidences.size == 0:
+        return np.array([])
+    elif bm25_confidences.size == 0 or np.all(bm25_confidences == 0):
+        return embedding_confidences
+    elif embedding_confidences.size == 0:
+        return bm25_confidences
+    return (weight_bm25 * bm25_confidences) + (weight_embed * embedding_confidences)
 
-# Adaptive retrieval with BM25, Chunk Merging, and Re-ranking
-def adaptive_retrieval(query, top_k=3, advanced=False):
-    query_year = get_year_from_query(query)
-    
-    finance_keywords = ["revenue", "profit", "earnings", "financial"]
-    if not any(word in query.lower() for word in finance_keywords):
-        return "This query is not related to financial data."
-    
-    if query_year is None:
-        return "Please specify relevant year or use terms like 'last year' or 'X years back'."
-
-    if advanced:
-        # Advanced RAG: BM25 + Year-Aware Chunk Merging + Re-ranking
-        # Step 1: BM25 for keyword-based retrieval
-        tokenized_query = query.split()
-        bm25_scores = bm25.get_scores(tokenized_query)
-        top_bm25_indices = np.argsort(bm25_scores)[::-1][:top_k * 2]  # Retrieve more chunks for merging and re-ranking
-        retrieved_chunks = [chunks[i] for i in top_bm25_indices]
-
-        # Step 2: Merge chunks for better context (year-aware merging)
-        merged_chunks = merge_chunks(retrieved_chunks, query_year, window_size=2)
-
-        bm25_confidences = compute_bm25_confidence([bm25_scores[i] for i in top_bm25_indices])
-        embedding_confidences = compute_embedding_confidence(query, merged_chunks, embed_model)
-        final_confidences = compute_final_confidence(bm25_confidences, embedding_confidences)
-
-        # Step 3: Re-rank using embeddings
-        reranked_chunks = rerank_chunks(query, merged_chunks, top_k)
-    else:
-        # Basic RAG: Embedding-based retrieval
-        query_embedding = embed_model.encode([query])
-        _, faiss_results = index.search(query_embedding, top_k)
-        valid_indices = [idx for idx in faiss_results[0] if idx != -1 and idx in chunk_map]
-        reranked_chunks = [chunk_map[idx] for idx in valid_indices]
-        final_confidences = compute_embedding_confidence(query, reranked_chunks, embed_model)
-
-    # Filter by year
-    filtered_chunks = [
-        chunk for chunk in reranked_chunks
-        if re.search(rf'\b{query_year}\b', chunk) and not re.search(rf'\b{query_year + 1}\b', chunk)
-    ]
-
-    # Clean response text
-    cleaned_chunks = [chunk.replace("\n", "").replace(" .", ".").strip() for chunk in filtered_chunks]
-
-    if not cleaned_chunks:
-        return f"No data found for the year {query_year}."
-
-    response = f"Here is the information I found for the year {query_year}:\n"
-    for i,chunk in enumerate(cleaned_chunks):
-        confidence = final_confidences[i] if i < len(final_confidences) else 0.5  # Default 0.5 if missing
-        response += f"- **{chunk}**\n  (Confidence: {confidence:.2f})\n"
-
-    return response
-
-# Helper function to extract year from query
 def get_year_from_query(query):
+    """Extract the year from the query."""
     current_year = datetime.now().year
     query_lower = query.lower()
-
-    # Regex to match a specific year (e.g., "2023", "2024")
-    year_match = re.search(r'\b(20\d{2})\b', query_lower)
+    year_match = re.search(r"\b(20\d{2})\b", query_lower)
     if year_match:
         return int(year_match.group(0))
-
-    # Handling relative year queries
     if "last year" in query_lower:
         return current_year - 1
     elif "this year" in query_lower:
@@ -195,26 +122,60 @@ def get_year_from_query(query):
         for word in query_lower.split():
             if word.isdigit():
                 return current_year - int(word)
-
-    # If no year or relative term is detected
     return None
 
-# 4. Guard Rail Implementation
-def filter_response(response):
-    banned_phrases = ["I think", "maybe", "possibly", "I'm not sure"]
-    for phrase in banned_phrases:
-        if phrase in response:
-            return "Filtered due to low confidence."
+def adaptive_retrieval(query, top_k=3, advanced=False):
+    """Retrieve and rank chunks based on the query."""
+    query_year = get_year_from_query(query)
+    if not any(word in query.lower() for word in FINANCE_KEYWORDS):
+        return "This query is not related to financial data."
+    if not query_year:
+        return "Please specify relevant year or use terms like 'last year' or 'X years back'."
+
+    if advanced:
+        tokenized_query = preprocess_text(query)
+        bm25_scores = bm25.get_scores(tokenized_query)
+        top_bm25_indices = np.argsort(bm25_scores)[::-1][:top_k * 2]
+        retrieved_chunks = [chunks[i] for i in top_bm25_indices]
+        merged_chunks = merge_chunks(retrieved_chunks, query_year)
+        bm25_confidences = compute_bm25_confidence(np.array([bm25_scores[i] for i in top_bm25_indices]))
+        embedding_confidences = compute_embedding_confidence(query, merged_chunks)
+        final_confidences = compute_final_confidence(bm25_confidences, embedding_confidences)
+        reranked_chunks = rerank_chunks(query, merged_chunks, top_k)
+    else:
+        query_embedding = embed_model.encode([query])
+        _, faiss_results = index.search(query_embedding, top_k)
+        valid_indices = [idx for idx in faiss_results[0] if idx != -1 and idx in chunk_map]
+        reranked_chunks = [chunk_map[idx] for idx in valid_indices]
+        final_confidences = compute_embedding_confidence(query, reranked_chunks)
+
+    filtered_chunks = [chunk for chunk in reranked_chunks if re.search(rf"\b{query_year}\b", chunk)]
+    cleaned_chunks = [chunk.replace("\n", "").replace(" .", ".").strip() for chunk in filtered_chunks]
+
+    if not cleaned_chunks:
+        return f"No data found for the year {query_year}."
+
+    response = f"Here is the information I found for the year {query_year}:\n"
+    for i, chunk in enumerate(cleaned_chunks):
+        confidence = final_confidences[i] if i < len(final_confidences) else 0.5
+        response += f"- **{chunk}**\n  (Confidence: {confidence:.2f})\n"
     return response
 
-# 5. UI Development with Streamlit
+# Load documents and preprocess
+documents = read_reports()
+chunks = [chunk for doc in documents for chunk in chunk_text(doc, CHUNK_SIZES["medium"])]
+embeddings = embed_model.encode(chunks, convert_to_numpy=True)
+index = faiss.IndexFlatL2(embeddings.shape[1])
+index.add(embeddings)
+chunk_map = {i: chunk for i, chunk in enumerate(chunks)}
+tokenized_chunks = [preprocess_text(chunk) for chunk in chunks]
+bm25 = BM25Okapi(tokenized_chunks)
+
+# Streamlit UI
 st.title("Financial Report RAG System")
 query = st.text_input("Enter your financial query:")
 if query:
     st.subheader("Basic RAG Response:")
-    basic_response = adaptive_retrieval(query, advanced=False)
-    st.write(basic_response)
-    
+    st.write(adaptive_retrieval(query, advanced=False))
     st.subheader("Advanced RAG Response (BM25 + Chunk Merging + Re-ranking):")
-    advanced_response = adaptive_retrieval(query, advanced=True)
-    st.write(advanced_response)
+    st.write(adaptive_retrieval(query, advanced=True))
