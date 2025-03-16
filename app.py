@@ -7,6 +7,7 @@ from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 from datetime import datetime
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import MinMaxScaler
 
 # 1. Data Collection & Preprocessing
 def read_reports(directory="financial_reports/"):
