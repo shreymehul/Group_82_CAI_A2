@@ -13,9 +13,16 @@ from nltk.tokenize import word_tokenize
 from nltk.stem import PorterStemmer
 import nltk
 
-# Download NLTK data files
-nltk.download("punkt")
-nltk.download("stopwords")
+# Set up NLTK data path
+nltk_data_path = os.path.join(os.getcwd(), "nltk_data")
+os.makedirs(nltk_data_path, exist_ok=True)
+nltk.data.path.append(nltk_data_path)
+
+# Download NLTK data files if they don't already exist
+if not os.path.exists(os.path.join(nltk_data_path, "tokenizers/punkt")):
+    nltk.download("punkt", download_dir=nltk_data_path)
+if not os.path.exists(os.path.join(nltk_data_path, "corpora/stopwords")):
+    nltk.download("stopwords", download_dir=nltk_data_path)
 
 # Constants
 CHUNK_SIZES = {"small": 50, "medium": 100, "large": 200}
