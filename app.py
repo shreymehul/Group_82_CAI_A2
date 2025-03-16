@@ -167,7 +167,7 @@ def adaptive_retrieval(query, top_k=3, advanced=False):
         return f"No data found for the year {query_year}."
 
     response = f"Here is the information I found for the year {query_year}:\n"
-    for chunk in cleaned_chunks:
+    for i,chunk in enumerate(cleaned_chunks):
         confidence = final_confidences[i] if i < len(final_confidences) else 0.5  # Default 0.5 if missing
         response += f"- **{chunk}**\n  (Confidence: {confidence:.2f})\n"
 
