@@ -13,7 +13,7 @@ from nltk.tokenize import word_tokenize
 from nltk.stem import PorterStemmer
 import nltk
 
-# Download NLTK resources (run once)
+# Download NLTK data files
 nltk.download("punkt")
 nltk.download("stopwords")
 
