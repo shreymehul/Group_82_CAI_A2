@@ -1,6 +1,6 @@
 nltk==3.8.1
 numpy==1.26.0
-faiss-cpu==1.7.4
+faiss-cpu-noavx2==1.7.4
 streamlit==1.27.0
 sentence-transformers==2.2.2
 rank-bm25==0.2.2
